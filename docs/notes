@@ -1,0 +1,5 @@
+
+1. Use -g to compile the code, like `g++ -o exp1 exp1.cpp -g`.
+2. Use objdump to dump dwarf info, like `objdump --dwarf exp1`.
+3. Compare the dwarf info dumpped by dwarf_parser and objdump.
+
