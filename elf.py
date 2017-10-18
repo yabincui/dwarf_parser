@@ -6,7 +6,9 @@ elf.py: a library used to read from elf files.
 """
 
 import argparse
+import os
 from struct import unpack
+import subprocess
 
 from const import *
 from elf_types import *
@@ -238,7 +240,7 @@ class Elf(object):
             elif opcode < header.opcode_base:
                 args = [opcode]
                 if opcode == DW_LNS_advance_line:
-                    args.append(data.getLeb128())
+                    args.append(data.getSleb128())
                 elif opcode == DW_LNS_fixed_advance_pc:
                     args.append(data.getUint(2))
                 else:
@@ -293,8 +295,11 @@ files = ['examples/exp1_32', 'examples/exp1_64']
 def write(msg):
     print(msg)
 
-def dump_wrapper(callback):
-    for file in files:
+def dump_wrapper(callback, args):
+    file_list = args.i
+    if not file_list:
+        file_list = files
+    for file in file_list:
         elf = Elf(file)
         write('file %s' % elf.file_path)
         callback(elf)
@@ -362,11 +367,17 @@ def dump_debug_abbrev(elf):
                     break
                 write('    %-18s %s' % (dwarf_attr_map.get(attr_name), dwarf_attr_form_map.get(attr_form)))
 
+class AddrDiff(object):
+    def __init__(self):
+        self.addr_diff = -1
+        self.addr = 0
+
 def dump_debug_line(elf):
     section = elf.section_names.get('.debug_line')
     if not section: return
     data = DataParser(section.get_data())
     write('section %s' % section.get_name())
+    addr_diff = AddrDiff()
     while not data.isEnd():
         offset = data.offset
         header = elf.read_dwarf_line(data)
@@ -417,11 +428,15 @@ def dump_debug_line(elf):
                     s = '  Extended opcode %d (%s)' % (extended_opcode, dwarf_line_extend_code_map.get(extended_opcode))
                     if extended_opcode == DW_LNE_end_sequence:
                         write('%s: End of sequence' % s)
+                        state = DwarfLineState(header.default_is_stmt)
                     elif extended_opcode == DW_LNE_set_address:
                         state.addr = DataParser(args[2]).getUint(elf.addr_size)
                         write('%s: Set address to 0x%x' % (s, state.addr))
+                    elif extended_opcode == DW_LNE_set_discriminator:
+                        write('%s' % s)
                     else:
                         write('%s' % s)
+                        log_exit('unhandled instruction')
                 else:
                     s = '  Standard opcode %d (%s)' % (opcode, dwarf_line_stdcode_map.get(opcode))
                     if opcode == DW_LNS_advance_pc:
@@ -439,13 +454,23 @@ def dump_debug_line(elf):
                         add_addr = (255 - header.opcode_base) / header.line_range * header.minimum_instruction_length
                         state.addr += add_addr
                         write('%s: Advance pc by 0x%x to 0x%x' % (s, add_addr, state.addr))
+                    elif opcode == DW_LNS_set_file:
+                        file_id = args[1]
+                        write('%s: Set file to %s' % (s, header.files[file_id-1][0]))
+                    elif opcode == DW_LNS_copy or opcode == DW_LNS_set_prologue_end or opcode == DW_LNS_negate_stmt:
+                        write('%s' % s)
                     else:
                         write('%s' % s)
+                        log_exit('unhandled instruction')
             write('')
             write('Decoded line table:')
             write('%20s  %11s  %11s' % ('File name', 'Line number', 'Start address'))
             state = DwarfLineState(header.default_is_stmt)
-            old_state = (state.file, state.line)
+            old_file_line = [None, None]
+            force_dump = False
+            force_reset = False
+            last_addr = None
+            last_addr_is_zero = False
             for args in header.opcodes:
                 opcode = args[0]
                 if opcode >= header.opcode_base:
@@ -454,10 +479,14 @@ def dump_debug_line(elf):
                     add_line = opcode % header.line_range + header.line_base
                     state.addr += add_addr
                     state.line += add_line
+                    force_dump = True
                 elif opcode == 0:
                     extended_opcode = args[1]
                     if extended_opcode == DW_LNE_set_address:
                         state.addr = DataParser(args[2]).getUint(elf.addr_size)
+                    elif extended_opcode == DW_LNE_end_sequence:
+                        force_dump = True
+                        force_reset = True
                 else:
                     if opcode == DW_LNS_advance_pc:
                         state.addr += args[1] * header.minimum_instruction_length
@@ -465,12 +494,33 @@ def dump_debug_line(elf):
                         state.line += args[1]
                     elif opcode == DW_LNS_const_add_pc or opcode == DW_LNS_fixed_advance_pc:
                         state.addr += (255 - header.opcode_base) / header.line_range * header.minimum_instruction_length
-                if old_state != (state.file, state.line):
-                    old_state = (state.file, state.line)
-                    write('%20s  %11d  0x%-9x' % (header.files[state.file-1][0], state.line, state.addr))
+                    elif opcode == DW_LNS_set_file:
+                        state.file = args[1]
+                    elif opcode == DW_LNS_copy:
+                        force_dump = True
+                if force_dump:
+                    force_dump = False
+                    if old_file_line[0] != state.file or old_file_line[1] != state.line:
+                        write('%20s  %11d  0x%-9x' % (header.files[state.file-1][0], state.line, state.addr))
+                        old_file_line[0] = state.file
+                        old_file_line[1] = state.line
+                    if (state.line == 0 or last_addr_is_zero) and last_addr >= 0x4001c0:
+                        diff = state.addr - last_addr
+                        if diff > addr_diff.addr_diff:
+                            addr_diff.addr_diff = diff
+                            addr_diff.addr = state.addr
+                            write('%20s  %11d  0x%-9x mark' % (header.files[state.file-1][0], state.line, state.addr))
+                    last_addr_is_zero = state.line == 0
+                    last_addr = state.addr
 
+                if force_reset:
+                    force_reset = False
+                    state = DwarfLineState(header.default_is_stmt)
+                    last_addr_is_zero = False
+                    last_addr = 0
 
         data.offset = header.endof_sequence
+    log_debug('addr_diff max_diff = 0x%x, addr = 0x%x' % (addr_diff.addr_diff, addr_diff.addr))
 
 
 def dump_symbol_table(elf):
@@ -509,6 +559,20 @@ def dump_strings(elf):
         log_info('\n')
 
 
+def extract_gnu_debugdata(file_path):
+    elf = Elf(file_path)
+    gnu_debugdata_section = elf.section_names.get('.gnu_debugdata')
+    if not gnu_debugdata_section:
+        log_exit('no .debug_gnudebugdata')
+    data = gnu_debugdata_section.get_data()
+    out_file = 'gnu_debugdata.xz'
+    with open(out_file, 'wb') as f:
+        f.write(data)
+    if os.path.isfile(out_file[:-3]):
+        os.remove(out_file[:-3])
+    subprocess.check_call(['xz', '-d', out_file])
+    log_info('write .debug_gnudebugdata to %s' % out_file[:-3])
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='parse dwarf sections')
@@ -519,19 +583,24 @@ if __name__ == '__main__':
     parser.add_argument('--dump-debug-line', action='store_true', help='dump .debug_line section.')
     parser.add_argument('--dump-symbols', action='store_true', help='dump .symtab section.')
     parser.add_argument('--dump-strings', action='store_true', help='dump string sections: .shstrtab, .dynstr, .strtab')
+    parser.add_argument('--extract-gnu-debugdata', action='store_true', help='extract .gnudebugdata.')
+    parser.add_argument('-i', nargs=1, help='Set input elf file.')
     args = parser.parse_args()
+    print('%s' % args)
 
     if args.dump_sec_names:
-        dump_wrapper(dump_section_names)
+        dump_wrapper(dump_section_names, args)
     if args.dump_sec_headers:
-        dump_wrapper(dump_section_headers)
+        dump_wrapper(dump_section_headers, args)
     if args.dump_debug_info:
-        dump_wrapper(dump_debug_info)
+        dump_wrapper(dump_debug_info, args)
     if args.dump_debug_abbrev:
-        dump_wrapper(dump_debug_abbrev)
+        dump_wrapper(dump_debug_abbrev, args)
     if args.dump_debug_line:
-        dump_wrapper(dump_debug_line)
+        dump_wrapper(dump_debug_line, args)
     if args.dump_symbols:
-        dump_wrapper(dump_symbol_table)
+        dump_wrapper(dump_symbol_table, args)
     if args.dump_strings:
-        dump_wrapper(dump_strings)
+        dump_wrapper(dump_strings, args)
+    if args.extract_gnu_debugdata:
+        extract_gnu_debugdata(args.i[0])
